@@ -1,0 +1,67 @@
+services:
+  # ===== PostgreSQL 15 Database (Tuned for 2GB RAM VPS) =====
+  postgres:
+    image: docker.io/library/postgres:15-alpine
+    container_name: crypto-bot-postgres
+    restart: unless-stopped
+    command: >
+      postgres
+      -c shared_buffers=128MB
+      -c effective_cache_size=384MB
+      -c work_mem=4MB
+      -c maintenance_work_mem=32MB
+      -c max_connections=40
+    environment:
+      POSTGRES_DB: crypto_bot
+      POSTGRES_USER: trader
+      POSTGRES_PASSWORD: secure_trading_password
+    ports:
+      - "127.0.0.1:5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data:Z
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U trader -d crypto_bot"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - crypto-bot-network
+
+  # ===== FastAPI Backend (Hunter CEX + Solana DEX Engine) =====
+  backend:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: localhost/tradingbot-backend:latest
+    container_name: solana-backend-dev
+    restart: always
+    ports:
+      - "8000:8000"
+    environment:
+      DATABASE_URL: "postgresql://trader:secure_trading_password@postgres:5432/crypto_bot"
+      BOT_MODE: PAPER
+      MAX_POSITION_SIZE_PCT: 10
+      MAX_PORTFOLIO_DRAWDOWN_PCT: 20
+      MAX_DAILY_LOSS_PCT: 5
+      MAX_OPEN_POSITIONS: 3
+      RISK_PER_TRADE_PCT: 1.5
+    env_file:
+      - .env
+    volumes:
+      - ./solana_trades.json:/app/solana_trades.json:Z
+      - ./solana_positions.json:/app/solana_positions.json:Z
+      - ./paper_trading_state.json:/app/paper_trading_state.json:Z
+      - ./logs:/app/logs:Z
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks:
+      - crypto-bot-network
+
+volumes:
+  postgres_data:
+    driver: local
+
+networks:
+  crypto-bot-network:
+    driver: bridge

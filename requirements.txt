@@ -1,0 +1,41 @@
+# FastAPI & Web Framework
+fastapi>=0.110.0
+anyio>=4.0.0
+uvicorn>=0.24.0
+python-dotenv>=1.0.0
+pydantic>=2.5.0
+
+# Authentication
+PyJWT==2.8.0
+
+# Rate Limiting
+slowapi==0.1.9
+
+# Database (PostgreSQL)
+psycopg2-binary==2.9.9
+sqlalchemy==2.0.23
+alembic==1.13.0
+
+# CCXT for Exchange API
+ccxt>=4.1.1
+
+# Data Analysis & Trading
+pandas>=2.1.3
+numpy>=1.26.2
+
+# Async HTTP Client
+aiohttp>=3.9.1
+
+# Solana Libraries
+solders>=0.18.0
+solana>=0.30.2
+
+# HTTP Requests
+requests>=2.31.0
+
+# Technical Analysis
+pandas-ta>=0.3.14b0
+
+# Optional: For advanced analysis
+# ta-lib==0.4.28  # Technical Analysis Library (optional)
+# matplotlib==3.8.2  # For plotting (optional)
