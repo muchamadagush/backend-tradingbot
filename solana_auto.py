@@ -21,21 +21,25 @@ from risk_manager import RiskManager, BotType, BOT_RISK_PROFILES
 
 
 # =============================
-# CONFIG
+# CONFIG (HIGH-WIN-RATE v3 — TUNED FOR RP 200.000 / ~0.10 SOL CAPITAL)
 # =============================
 POSITIONS_FILE = "solana_positions.json"
-MAX_POSITIONS = 3  # Max 3 concurrent positions per P2
+MAX_POSITIONS = int(os.getenv("SOLANA_MAX_POSITIONS", "1"))  # Focused 1 position at a time for micro-capital
 CANDLE_LIMIT = 120
 
-# Position Sizing Config (P2 Fix)
-POSITION_SIZE_PCT = 0.015  # 1.5% of portfolio per trade
-DEFAULT_SOL_BALANCE = 1.0  # Fallback if balance fetch fails
-MIN_TRADE_SOL = 0.01       # Minimum trade size
-MAX_TRADE_SOL = 0.1        # Maximum trade size (safety cap)
+# Position Sizing & Gas Reserve Config (Tuned for ~0.10 SOL Phantom Wallet)
+POSITION_SIZE_PCT = float(os.getenv("SOLANA_POSITION_SIZE_PCT", "0.25"))  # 25% of SOL balance per focused trade
+DEFAULT_SOL_BALANCE = 0.10  # Realistic fallback for Rp 200.000 capital (~0.10 SOL)
+MIN_TRADE_SOL = float(os.getenv("SOLANA_MIN_TRADE_SOL", "0.025"))         # Optimal micro-capital trade size (0.025 SOL)
+MAX_TRADE_SOL = float(os.getenv("SOLANA_MAX_TRADE_SOL", "0.10"))          # Safety cap per trade
+RESERVE_GAS_SOL = float(os.getenv("SOLANA_RESERVE_GAS_SOL", "0.020"))     # Mandatory 0.020 SOL buffer for ATA rent & sell gas
 
-# Trailing Stop Config (PnL-% Based to remain invariant across 50% TP1 partial sells)
-TRAILING_STOP_ACTIVATION_PCT = 9.0   # Activate after +9.0% profit
-TRAILING_STOP_DISTANCE_PCT = 3.5     # Trail 3.5% behind peak PnL% (locks at least +5.5% profit on activation)
+# Micro-Capital Single Exit Mode (Saves 50% exit swap gas fees by avoiding 2-step partial sells)
+MICRO_CAPITAL_SINGLE_EXIT = os.getenv("SOLANA_MICRO_SINGLE_EXIT", "true").lower() == "true"
+
+# 3-Tier Fast Trailing Stop Config (High-Win-Rate v3)
+TRAILING_STOP_ACTIVATION_PCT = 6.5   # Activate trailing stop at +6.5% profit (locks +4.5% minimum)
+TRAILING_STOP_DISTANCE_PCT = 2.0     # Base trail distance: 2.0% (tightens to 1.5% at +10% and 1.2% at +15%)
 
 
 # =============================
@@ -55,6 +59,7 @@ class SolanaAutoBot:
         self.recently_sold: List[str] = []
 
         self.trader_strategy = SolanaTraderStrategy()
+        self.trader_strategy.MICRO_CAPITAL_SINGLE_EXIT = MICRO_CAPITAL_SINGLE_EXIT
 
         # Track SOL balance for percentage-based sizing
         self.cached_sol_balance = DEFAULT_SOL_BALANCE
@@ -63,9 +68,9 @@ class SolanaAutoBot:
         # {token: {"high_water_mark_pnl_pct": float, "trailing_active": bool}}
         self.trailing_stop_state: Dict[str, Dict] = {}
 
-        # Per-bot risk manager for Trader
+        # Per-bot risk manager for Trader (scaled to SOL balance)
         self.risk_manager = RiskManager(
-            initial_balance=100.0,  # SOL balance estimate
+            initial_balance=DEFAULT_SOL_BALANCE,
             bot_type=BotType.TRADER
         )
 
@@ -103,26 +108,38 @@ class SolanaAutoBot:
         self.save_positions()
 
     # =============================
-    # SOL BALANCE FOR POSITION SIZING (P2 FIX)
+    # SOL BALANCE & GAS-SAFE POSITION SIZING (v3)
     # =============================
     async def refresh_sol_balance(self) -> float:
-        """Fetch current SOL balance for percentage-based position sizing."""
+        """Fetch current SOL balance and sync RiskManager capital."""
         try:
             balances = await jupiter_bot.get_token_balances()
             if balances and isinstance(balances, dict):
-                sol_balance = balances.get("SOL", 0)
+                sol_balance = float(balances.get("SOL", 0) or 0)
                 if sol_balance > 0:
                     self.cached_sol_balance = sol_balance
+                    if self.risk_manager.initial_balance == DEFAULT_SOL_BALANCE and sol_balance != DEFAULT_SOL_BALANCE:
+                        self.risk_manager.initial_balance = sol_balance
+                        self.risk_manager.current_balance = sol_balance
+                        self.risk_manager.peak_balance = max(self.risk_manager.peak_balance, sol_balance)
                     return sol_balance
         except Exception as e:
             sys_logger.add_log(f"⚠️ Balance fetch failed: {e}")
         return self.cached_sol_balance
 
     def calculate_position_size(self, balance: float) -> float:
-        """Calculate position size as percentage of portfolio (P2 Fix)."""
-        size = balance * POSITION_SIZE_PCT
-        size = max(MIN_TRADE_SOL, min(MAX_TRADE_SOL, size))
-        return round(size, 6)
+        """
+        Calculate position size while strictly protecting RESERVE_GAS_SOL (0.020 SOL)
+        so the wallet never runs out of SOL for ATA rent or sell transaction fees.
+        """
+        tradable_sol = max(0.0, balance - RESERVE_GAS_SOL)
+        if tradable_sol < 0.01:
+            return 0.0
+
+        desired_size = balance * POSITION_SIZE_PCT
+        clamped_size = max(MIN_TRADE_SOL, min(MAX_TRADE_SOL, desired_size))
+        final_size = min(clamped_size, tradable_sol)
+        return round(final_size, 6)
 
     # =============================
     # TOKEN DECIMALS (CRITICAL FIX)
@@ -186,7 +203,7 @@ class SolanaAutoBot:
             self.target_token = token_symbol
 
         sys_logger.add_log(
-            f"🚀 AUTO STARTED | Mode={mode} Strategy=SOLANA_TRADER"
+            f"🚀 AUTO STARTED | Mode={mode} Strategy=SOLANA_TRADER_v3 (MaxPos={MAX_POSITIONS}, MinSOL={MIN_TRADE_SOL})"
         )
 
         while self.is_running:
@@ -299,10 +316,18 @@ class SolanaAutoBot:
         )
         entry_atr = float(atr_series.iloc[-1]) if atr_series is not None and not pd.isna(atr_series.iloc[-1]) else 0.0
 
-        # ---- PERCENTAGE-BASED POSITION SIZING (P2 FIX) ----
+        # ---- GAS-SAFE POSITION SIZING (v3) ----
         sol_balance = await self.refresh_sol_balance()
         trade_amount = self.calculate_position_size(sol_balance)
-        sys_logger.add_log(f"💰 Position size: {trade_amount:.4f} SOL ({POSITION_SIZE_PCT*100}% of {sol_balance:.4f})")
+        if trade_amount < 0.01:
+            sys_logger.add_log(
+                f"⚠️ Insufficient tradable SOL ({sol_balance:.4f} SOL total, keeping {RESERVE_GAS_SOL:.3f} SOL gas reserve)"
+            )
+            return
+
+        sys_logger.add_log(
+            f"💰 Position size: {trade_amount:.4f} SOL (Wallet: {sol_balance:.4f} SOL, Gas Reserve: {RESERVE_GAS_SOL:.3f} SOL)"
+        )
 
         # ---- JUPITER QUOTE WITH FRESHNESS VALIDATION ----
         QUOTE_MAX_AGE_SECONDS = 5
@@ -355,6 +380,7 @@ class SolanaAutoBot:
             "entry_time": time.time(),
             "strategy": "SOLANA_TRADER",
             "tp1_hit": False,
+            "be_shield_active": False,
             "txid": res["txid"]
         }
 
@@ -371,11 +397,11 @@ class SolanaAutoBot:
         )
 
         sys_logger.add_log(
-            f"✅ BOUGHT {self.target_token} for {trade_amount:.4f} SOL | Dynamic SL: {pos.get('dynamic_sl_pct', -6.5):.2f}%"
+            f"✅ BOUGHT {self.target_token} for {trade_amount:.4f} SOL | Dynamic SL: {pos.get('dynamic_sl_pct', -5.5):.2f}% | BE Shield @ +{self.trader_strategy.EARLY_BE_TRIGGER_PCT}%"
         )
 
     # =============================
-    # SELL LOGIC (PNL-% TRAILING STOP + SAFE PARTIAL TP1)
+    # SELL LOGIC (EARLY BREAKEVEN SHIELD + 3-TIER ADAPTIVE TRAILING STOP)
     # =============================
     async def check_all_exit_conditions(self):
         for pos in self.active_positions[:]:
@@ -405,7 +431,19 @@ class SolanaAutoBot:
         pnl_pct = ((current_sol - entry) / entry) * 100.0
         pos["pnl_pct"] = pnl_pct
 
-        # ========== PNL-% BASED TRAILING STOP LOGIC (INVARIANT TO PARTIAL SELLS) ==========
+        # ---- STAGE 1: EARLY BREAKEVEN SHIELD (+4.2% -> Locks +1.0% Net Profit) ----
+        if pnl_pct >= self.trader_strategy.EARLY_BE_TRIGGER_PCT and not pos.get("be_shield_active"):
+            pos["be_shield_active"] = True
+            pos["dynamic_sl_pct"] = max(
+                float(pos.get("dynamic_sl_pct", self.trader_strategy.HARD_SL_PCT)),
+                self.trader_strategy.EARLY_BE_LOCK_PCT
+            )
+            self.save_positions()
+            sys_logger.add_log(
+                f"🛡️ {token}: Early Breakeven Shield activated at +{pnl_pct:.1f}% (SL locked at +{pos['dynamic_sl_pct']:.1f}%)"
+            )
+
+        # ========== 3-TIER ADAPTIVE PNL-% TRAILING STOP LOGIC ==========
         trailing_exit = False
         trailing_reason = ""
 
@@ -421,30 +459,38 @@ class SolanaAutoBot:
         if pnl_pct > ts_state["high_water_mark_pnl_pct"]:
             ts_state["high_water_mark_pnl_pct"] = pnl_pct
 
-        # Activate trailing stop when profit reaches threshold (+9.0%)
+        # Activate trailing stop when profit reaches threshold (+6.5%)
         if pnl_pct >= TRAILING_STOP_ACTIVATION_PCT and not ts_state["trailing_active"]:
             ts_state["trailing_active"] = True
-            sys_logger.add_log(f"🎯 {token}: Trailing stop activated at +{pnl_pct:.1f}%")
+            sys_logger.add_log(f"🎯 {token}: Fast Trailing Stop activated at +{pnl_pct:.1f}%")
 
-        # Check if trailing stop hit (e.g. peak +14.0%, trail 3.5% -> triggers at +10.5%)
+        # Check 3-tier adaptive trailing stop distance
         if ts_state["trailing_active"]:
             hwm_pnl = ts_state["high_water_mark_pnl_pct"]
-            # Tighten trail distance to 2.5% once TP1 (+12%) has already been banked!
-            effective_trail_dist = 2.5 if pos.get("tp1_hit") else TRAILING_STOP_DISTANCE_PCT
-            trail_stop_pnl = hwm_pnl - effective_trail_dist
+            if hwm_pnl >= 15.0:
+                effective_trail_dist = 1.2
+            elif hwm_pnl >= 10.0 or pos.get("tp1_hit"):
+                effective_trail_dist = 1.5
+            else:
+                effective_trail_dist = TRAILING_STOP_DISTANCE_PCT
+
+            trail_stop_pnl = max(hwm_pnl - effective_trail_dist, self.trader_strategy.EARLY_BE_LOCK_PCT)
 
             if pnl_pct <= trail_stop_pnl:
                 trailing_exit = True
-                trailing_reason = f"TRAILING_STOP (peak +{hwm_pnl:.1f}%, now +{pnl_pct:.1f}%)"
+                trailing_reason = f"TRAILING_STOP (peak +{hwm_pnl:.1f}%, now +{pnl_pct:.1f}%, trail {effective_trail_dist:.1f}%)"
 
         # ========== STRATEGY-BASED EXIT ==========
+        was_tp1_hit = bool(pos.get("tp1_hit", False))
         should_sell, reason = self.trader_strategy.should_sell(
             pos,
             market={}
         )
+        if not was_tp1_hit and pos.get("tp1_hit"):
+            self.save_positions()
 
-        # Prioritize TP1 partial before trailing stop if TP1 hasn't been hit yet
-        if should_sell and reason == "tp1 partial":
+        # Prioritize TP1 partial before trailing stop only if partial mode is enabled
+        if should_sell and reason == "tp1 partial" and not MICRO_CAPITAL_SINGLE_EXIT:
             pass
         elif trailing_exit:
             should_sell = True
@@ -455,7 +501,7 @@ class SolanaAutoBot:
 
         sys_logger.add_log(f"🚨 SELL {token}: {reason}")
 
-        is_partial = (reason == "tp1 partial")
+        is_partial = (reason == "tp1 partial") and not MICRO_CAPITAL_SINGLE_EXIT
         sell_amount = (amount * 0.5) if is_partial else amount
 
         if is_partial:
@@ -498,7 +544,7 @@ class SolanaAutoBot:
             pos["entry_price_sol"] = entry - cost_basis_slice
             pos["tp1_hit"] = True
             pos["dynamic_sl_pct"] = self.trader_strategy.BREAKEVEN_LOCK_PCT
-            self.save_positions()  # Persist updated 50% balance & breakeven SL to disk!
+            self.save_positions()
             self.risk_manager.record_trade_pnl(pnl_sol)
             sys_logger.add_log(
                 f"✅ PARTIAL SOLD (50%) {token} | Received: {sold_sol:.4f} SOL | PnL: +{pnl_sol:.4f} SOL | SL moved to +{pos['dynamic_sl_pct']}%"
@@ -515,7 +561,7 @@ class SolanaAutoBot:
             self.recently_sold.append(token)
             self.recently_sold = self.recently_sold[-50:]
 
-            sys_logger.add_log(f"✅ SOLD {token} | PnL: {pnl_sol:+.4f} SOL")
+            sys_logger.add_log(f"✅ SOLD {token} | PnL: {pnl_sol:+.4f} SOL ({pnl_pct:+.2f}%)")
 
 
 # =============================
