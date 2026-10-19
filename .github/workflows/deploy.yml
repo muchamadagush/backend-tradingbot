@@ -1,0 +1,113 @@
+name: Deploy Backend (Tag-Based DEV & PROD on main) to VPS via Podman
+
+on:
+  push:
+    tags:
+      - "*"            # Menangkap SEMUA format tag (dev-*, prod-*, v1.0, v1.0.1, dll.)
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: "Target Environment to Deploy (from main branch or tag)"
+        required: true
+        default: "dev"
+        type: choice
+        options:
+          - dev
+          - prod
+      git_ref:
+        description: "Git branch or tag to deploy (default: main)"
+        required: false
+        default: "main"
+        type: string
+
+concurrency:
+  group: deploy-backend-${{ github.ref_name }}
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    name: Deploy to Ubuntu VPS (Podman)
+    runs-on: ubuntu-latest
+    # Mendaftarkan job ini ke tab "Deployments" di GitHub (Environment: dev / prod)
+    environment:
+      name: ${{ (github.event_name == 'workflow_dispatch' && inputs.environment) || ((startsWith(github.ref_name, 'dev') || contains(github.ref_name, 'dev')) && 'dev' || 'prod') }}
+    steps:
+      - name: Determine Environment & Git Ref from Tag
+        id: env_target
+        run: |
+          REF_NAME="${{ github.ref_name }}"
+
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            TARGET="${{ github.event.inputs.environment }}"
+            GIT_REF="${{ github.event.inputs.git_ref || 'main' }}"
+          else
+            GIT_REF="$REF_NAME"
+            # Jika nama tag mengandung kata "dev", arahkan ke DEV (Port 8001); selain itu ke PROD (Port 8000)
+            if [[ "$REF_NAME" == *dev* ]]; then
+              TARGET="dev"
+            else
+              TARGET="prod"
+            fi
+          fi
+
+          if [ "$TARGET" = "prod" ]; then
+            echo "env_name=prod" >> $GITHUB_OUTPUT
+            echo "git_ref=$GIT_REF" >> $GITHUB_OUTPUT
+            echo "deploy_dir=/opt/tradingbot/prod" >> $GITHUB_OUTPUT
+            echo "app_port=8000" >> $GITHUB_OUTPUT
+            echo "project_name=tradingbot-prod" >> $GITHUB_OUTPUT
+          else
+            echo "env_name=dev" >> $GITHUB_OUTPUT
+            echo "git_ref=$GIT_REF" >> $GITHUB_OUTPUT
+            echo "deploy_dir=/opt/tradingbot/dev" >> $GITHUB_OUTPUT
+            echo "app_port=8001" >> $GITHUB_OUTPUT
+            echo "project_name=tradingbot-dev" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Deploy via SSH & Podman Compose
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.VPS_HOST }}
+          username: ${{ secrets.VPS_USER }}
+          key: ${{ secrets.VPS_SSH_KEY }}
+          port: ${{ secrets.VPS_PORT || 22 }}
+          command_timeout: 15m
+          script: |
+            set -e
+            ENV_NAME="${{ steps.env_target.outputs.env_name }}"
+            DEPLOY_DIR="${{ steps.env_target.outputs.deploy_dir }}"
+            GIT_REF="${{ steps.env_target.outputs.git_ref }}"
+            PROJECT_NAME="${{ steps.env_target.outputs.project_name }}"
+            APP_PORT="${{ steps.env_target.outputs.app_port }}"
+
+            echo "🚀 Deploying [${PROJECT_NAME}] from ref/tag [${GIT_REF}] to ${DEPLOY_DIR} (Port ${APP_PORT})..."
+
+            mkdir -p "$DEPLOY_DIR"
+            cd "$DEPLOY_DIR"
+
+            # Pastikan file state JSON & folder logs selalu tersedia agar bind-mount Podman tidak gagal
+            touch solana_trades.json solana_positions.json paper_trading_state.json
+            [ -s solana_trades.json ] || echo "[]" > solana_trades.json
+            [ -s solana_positions.json ] || echo "[]" > solana_positions.json
+            [ -s paper_trading_state.json ] || echo "{}" > paper_trading_state.json
+            mkdir -p logs
+
+            # Ambil seluruh commit & tag terbaru dari branch main di GitHub
+            git fetch origin main --tags --force
+            git checkout --force "$GIT_REF"
+
+            # Build dan jalankan container PostgreSQL + Backend dengan nama project terisolasi
+            podman-compose -p "$PROJECT_NAME" -f docker-compose.yml up -d --build
+
+            # Pastikan 9 tabel PostgreSQL terinisialisasi otomatis di container
+            sleep 5
+            podman exec "solana-backend-${ENV_NAME}" python init_pg_db_cli.py || true
+
+            # Bersihkan dangling image lama agar disk 40GB tidak penuh
+            podman image prune -f
+
+            # Healthcheck verifikasi PostgreSQL & Backend
+            podman ps --filter "name=${ENV_NAME}"
+            curl -fsS "http://127.0.0.1:${APP_PORT}/docs" >/dev/null && \
+              echo "✅ Healthcheck OK on port ${APP_PORT} (Tag/Ref: ${GIT_REF})!" || \
+              echo "⚠️ Backend masih starting up, cek podman logs."
