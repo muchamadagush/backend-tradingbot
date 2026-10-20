@@ -28,7 +28,6 @@ jobs:
   deploy:
     name: Deploy to Ubuntu VPS (Podman)
     runs-on: ubuntu-latest
-    # Mendaftarkan job ini ke tab "Deployments" di GitHub (Environment: dev / prod)
     environment:
       name: ${{ (github.event_name == 'workflow_dispatch' && inputs.environment) || ((startsWith(github.ref_name, 'dev') || contains(github.ref_name, 'dev')) && 'dev' || 'prod') }}
     steps:
@@ -42,7 +41,6 @@ jobs:
             GIT_REF="${{ github.event.inputs.git_ref || 'main' }}"
           else
             GIT_REF="$REF_NAME"
-            # Jika nama tag mengandung kata "dev", arahkan ke DEV (Port 8001); selain itu ke PROD (Port 8000)
             if [[ "$REF_NAME" == *dev* ]]; then
               TARGET="dev"
             else
@@ -55,12 +53,16 @@ jobs:
             echo "git_ref=$GIT_REF" >> $GITHUB_OUTPUT
             echo "deploy_dir=/opt/tradingbot/prod" >> $GITHUB_OUTPUT
             echo "app_port=8000" >> $GITHUB_OUTPUT
+            echo "pg_port=5432" >> $GITHUB_OUTPUT
+            echo "pg_db=crypto_bot_prod" >> $GITHUB_OUTPUT
             echo "project_name=tradingbot-prod" >> $GITHUB_OUTPUT
           else
             echo "env_name=dev" >> $GITHUB_OUTPUT
             echo "git_ref=$GIT_REF" >> $GITHUB_OUTPUT
             echo "deploy_dir=/opt/tradingbot/dev" >> $GITHUB_OUTPUT
             echo "app_port=8001" >> $GITHUB_OUTPUT
+            echo "pg_port=5433" >> $GITHUB_OUTPUT
+            echo "pg_db=crypto_bot_dev" >> $GITHUB_OUTPUT
             echo "project_name=tradingbot-dev" >> $GITHUB_OUTPUT
           fi
 
@@ -79,13 +81,15 @@ jobs:
             GIT_REF="${{ steps.env_target.outputs.git_ref }}"
             PROJECT_NAME="${{ steps.env_target.outputs.project_name }}"
             APP_PORT="${{ steps.env_target.outputs.app_port }}"
+            PG_PORT="${{ steps.env_target.outputs.pg_port }}"
+            PG_DB="${{ steps.env_target.outputs.pg_db }}"
 
-            echo "🚀 Deploying [${PROJECT_NAME}] from ref/tag [${GIT_REF}] to ${DEPLOY_DIR} (Port ${APP_PORT})..."
+            echo "🚀 Deploying [${PROJECT_NAME}] from ref/tag [${GIT_REF}] to ${DEPLOY_DIR} (API Port ${APP_PORT}, DB Port ${PG_PORT})..."
 
             mkdir -p "$DEPLOY_DIR"
             cd "$DEPLOY_DIR"
 
-            # Pastikan file state JSON & folder logs selalu tersedia agar bind-mount Podman tidak gagal
+            # Pastikan file state JSON & folder logs tersedia agar bind-mount Podman tidak gagal
             touch solana_trades.json solana_positions.json paper_trading_state.json
             [ -s solana_trades.json ] || echo "[]" > solana_trades.json
             [ -s solana_positions.json ] || echo "[]" > solana_positions.json
@@ -96,18 +100,52 @@ jobs:
             git fetch origin main --tags --force
             git checkout --force "$GIT_REF"
 
-            # Build dan jalankan container PostgreSQL + Backend dengan nama project terisolasi
+            # Pastikan variabel port & container name di .env sinkron (tanpa menimpa API key / Private key)
+            touch .env
+            grep -q "^ENV_TAG=" .env && sed -i "s/^ENV_TAG=.*/ENV_TAG=${ENV_NAME}/" .env || echo "ENV_TAG=${ENV_NAME}" >> .env
+            grep -q "^APP_PORT=" .env && sed -i "s/^APP_PORT=.*/APP_PORT=${APP_PORT}/" .env || echo "APP_PORT=${APP_PORT}" >> .env
+            grep -q "^BACKEND_CONTAINER_NAME=" .env && sed -i "s/^BACKEND_CONTAINER_NAME=.*/BACKEND_CONTAINER_NAME=solana-backend-${ENV_NAME}/" .env || echo "BACKEND_CONTAINER_NAME=solana-backend-${ENV_NAME}" >> .env
+            grep -q "^POSTGRES_CONTAINER_NAME=" .env && sed -i "s/^POSTGRES_CONTAINER_NAME=.*/POSTGRES_CONTAINER_NAME=crypto-bot-postgres-${ENV_NAME}/" .env || echo "POSTGRES_CONTAINER_NAME=crypto-bot-postgres-${ENV_NAME}" >> .env
+            grep -q "^POSTGRES_PORT=" .env && sed -i "s/^POSTGRES_PORT=.*/POSTGRES_PORT=${PG_PORT}/" .env || echo "POSTGRES_PORT=${PG_PORT}" >> .env
+            grep -q "^POSTGRES_DB=" .env && sed -i "s/^POSTGRES_DB=.*/POSTGRES_DB=${PG_DB}/" .env || echo "POSTGRES_DB=${PG_DB}" >> .env
+            grep -q "^POSTGRES_USER=" .env || echo "POSTGRES_USER=trader" >> .env
+            grep -q "^POSTGRES_PASSWORD=" .env || echo "POSTGRES_PASSWORD=tradingbot_${ENV_NAME}_pass_2026" >> .env
+
+            DB_PASS=$(grep "^POSTGRES_PASSWORD=" .env | tail -n 1 | cut -d '=' -f2- | tr -d '\r')
+            DB_USER=$(grep "^POSTGRES_USER=" .env | tail -n 1 | cut -d '=' -f2- | tr -d '\r')
+            DB_NAME=$(grep "^POSTGRES_DB=" .env | tail -n 1 | cut -d '=' -f2- | tr -d '\r')
+
+            # Hentikan container lama di project ini agar port tidak bentrok saat recreate
+            podman-compose -p "$PROJECT_NAME" -f docker-compose.yml down || true
+            podman rm -f "solana-backend-${ENV_NAME}" "crypto-bot-postgres-${ENV_NAME}" 2>/dev/null || true
+
+            # Build dan jalankan container PostgreSQL + Backend
             podman-compose -p "$PROJECT_NAME" -f docker-compose.yml up -d --build
 
-            # Pastikan 9 tabel PostgreSQL terinisialisasi otomatis di container
-            sleep 5
-            podman exec "solana-backend-${ENV_NAME}" python init_pg_db_cli.py || true
+            # Tunggu hingga PostgreSQL siap menerima koneksi
+            echo "⏳ Waiting for PostgreSQL (crypto-bot-postgres-${ENV_NAME}) to become ready..."
+            for i in $(seq 1 15); do
+              if podman exec "crypto-bot-postgres-${ENV_NAME}" pg_isready -U "${DB_USER:-trader}" >/dev/null 2>&1; then
+                echo "✅ PostgreSQL is ready!"
+                break
+              fi
+              sleep 2
+            done
+
+            # Sinkronkan password & nama database di volume PostgreSQL jika volume sudah pernah dibuat sebelumnya
+            podman exec "crypto-bot-postgres-${ENV_NAME}" psql -U "${DB_USER:-trader}" -d postgres -c "ALTER USER ${DB_USER:-trader} WITH PASSWORD '${DB_PASS}';" || true
+            podman exec "crypto-bot-postgres-${ENV_NAME}" psql -U "${DB_USER:-trader}" -d postgres -tc "SELECT 1 FROM pg_database WHERE datname = '${DB_NAME}'" | grep -q 1 || \
+              podman exec "crypto-bot-postgres-${ENV_NAME}" psql -U "${DB_USER:-trader}" -d postgres -c "CREATE DATABASE ${DB_NAME} OWNER ${DB_USER:-trader};" || true
+
+            # Inisialisasi 9 tabel PostgreSQL secara otomatis
+            podman exec "solana-backend-${ENV_NAME}" python init_pg_db_cli.py
 
             # Bersihkan dangling image lama agar disk 40GB tidak penuh
             podman image prune -f
 
             # Healthcheck verifikasi PostgreSQL & Backend
+            sleep 4
             podman ps --filter "name=${ENV_NAME}"
             curl -fsS "http://127.0.0.1:${APP_PORT}/docs" >/dev/null && \
               echo "✅ Healthcheck OK on port ${APP_PORT} (Tag/Ref: ${GIT_REF})!" || \
-              echo "⚠️ Backend masih starting up, cek podman logs."
+              echo "⚠️ Backend masih starting up, cek: sudo podman logs solana-backend-${ENV_NAME}"
