@@ -115,37 +115,52 @@ jobs:
             DB_USER=$(grep "^POSTGRES_USER=" .env | tail -n 1 | cut -d '=' -f2- | tr -d '\r')
             DB_NAME=$(grep "^POSTGRES_DB=" .env | tail -n 1 | cut -d '=' -f2- | tr -d '\r')
 
-            # Hentikan container lama di project ini agar port tidak bentrok saat recreate
+            # 1. Hentikan container lama di project ini agar port tidak bentrok
             podman-compose -p "$PROJECT_NAME" -f docker-compose.yml down || true
             podman rm -f "solana-backend-${ENV_NAME}" "crypto-bot-postgres-${ENV_NAME}" 2>/dev/null || true
 
-            # Build dan jalankan container PostgreSQL + Backend
-            podman-compose -p "$PROJECT_NAME" -f docker-compose.yml up -d --build
+            # 2. Nyalakan PostgreSQL TERLEBIH DAHULU (tanpa backend) agar tidak terjadi race condition
+            podman-compose -p "$PROJECT_NAME" -f docker-compose.yml up -d postgres
 
-            # Tunggu hingga PostgreSQL siap menerima koneksi
             echo "⏳ Waiting for PostgreSQL (crypto-bot-postgres-${ENV_NAME}) to become ready..."
             for i in $(seq 1 15); do
-              if podman exec "crypto-bot-postgres-${ENV_NAME}" pg_isready -U "${DB_USER:-trader}" >/dev/null 2>&1; then
+              if podman exec "crypto-bot-postgres-${ENV_NAME}" pg_isready -U "${DB_USER:-trader}" -d postgres >/dev/null 2>&1; then
                 echo "✅ PostgreSQL is ready!"
                 break
               fi
               sleep 2
             done
+            sleep 2
 
-            # Sinkronkan password & nama database di volume PostgreSQL jika volume sudah pernah dibuat sebelumnya
-            podman exec "crypto-bot-postgres-${ENV_NAME}" psql -U "${DB_USER:-trader}" -d postgres -c "ALTER USER ${DB_USER:-trader} WITH PASSWORD '${DB_PASS}';" || true
-            podman exec "crypto-bot-postgres-${ENV_NAME}" psql -U "${DB_USER:-trader}" -d postgres -tc "SELECT 1 FROM pg_database WHERE datname = '${DB_NAME}'" | grep -q 1 || \
-              podman exec "crypto-bot-postgres-${ENV_NAME}" psql -U "${DB_USER:-trader}" -d postgres -c "CREATE DATABASE ${DB_NAME} OWNER ${DB_USER:-trader};" || true
+            # 3. Sinkronkan password user & pastikan database tersedia sebelum backend dinyalakan
+            podman exec "crypto-bot-postgres-${ENV_NAME}" psql -U "${DB_USER:-trader}" -d postgres -v ON_ERROR_STOP=0 -c "ALTER USER ${DB_USER:-trader} WITH PASSWORD '${DB_PASS}';" >/dev/null 2>&1 || true
+            DB_EXISTS=$(podman exec "crypto-bot-postgres-${ENV_NAME}" psql -U "${DB_USER:-trader}" -d postgres -tAc "SELECT 1 FROM pg_database WHERE datname='${DB_NAME}'" 2>/dev/null | tr -d '[:space:]' || true)
+            if [ "$DB_EXISTS" != "1" ]; then
+              podman exec "crypto-bot-postgres-${ENV_NAME}" psql -U "${DB_USER:-trader}" -d postgres -v ON_ERROR_STOP=0 -c "CREATE DATABASE ${DB_NAME} OWNER ${DB_USER:-trader};" >/dev/null 2>&1 || true
+            fi
 
-            # Inisialisasi 9 tabel PostgreSQL secara otomatis
-            podman exec "solana-backend-${ENV_NAME}" python init_pg_db_cli.py
+            # 4. Build dan nyalakan Backend (otomatis menjalankan init_pg_db_cli.py & uvicorn di APP_PORT)
+            podman-compose -p "$PROJECT_NAME" -f docker-compose.yml up -d --build backend
 
-            # Bersihkan dangling image lama agar disk 40GB tidak penuh
+            # 5. Bersihkan dangling image lama agar disk 40GB tidak penuh
             podman image prune -f
 
-            # Healthcheck verifikasi PostgreSQL & Backend
-            sleep 4
+            # 6. Healthcheck verifikasi Backend (tunggu hingga 20 detik sampai Uvicorn siap)
+            echo "⏳ Waiting for FastAPI Backend on port ${APP_PORT}..."
+            HEALTH_OK=0
+            for i in $(seq 1 10); do
+              if curl -fsS "http://127.0.0.1:${APP_PORT}/docs" >/dev/null 2>&1; then
+                HEALTH_OK=1
+                break
+              fi
+              sleep 2
+            done
+
             podman ps --filter "name=${ENV_NAME}"
-            curl -fsS "http://127.0.0.1:${APP_PORT}/docs" >/dev/null && \
-              echo "✅ Healthcheck OK on port ${APP_PORT} (Tag/Ref: ${GIT_REF})!" || \
-              echo "⚠️ Backend masih starting up, cek: sudo podman logs solana-backend-${ENV_NAME}"
+            if [ "$HEALTH_OK" = "1" ]; then
+              echo "✅ Healthcheck OK on port ${APP_PORT} (Tag/Ref: ${GIT_REF})!"
+            else
+              echo "⚠️ Backend belum merespons di port ${APP_PORT}, menampilkan 30 baris log terakhir:"
+              podman logs --tail 30 "solana-backend-${ENV_NAME}" || true
+              exit 1
+            fi

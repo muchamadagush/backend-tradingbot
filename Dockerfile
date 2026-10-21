@@ -1,6 +1,5 @@
 # File: backend/Dockerfile
 # Optimized for 2GB RAM VPS & Podman (excludes unused matplotlib/numba/backtrader bloat)
-
 FROM docker.io/library/python:3.12-slim
 
 WORKDIR /app
@@ -22,7 +21,7 @@ RUN pip install --no-cache-dir --upgrade pip && \
 
 COPY . .
 
-EXPOSE 8000
+EXPOSE 8000 8001
 
-# Auto-initialize PostgreSQL tables (init_pg_db_cli.py) before launching FastAPI Uvicorn server
-CMD ["sh", "-c", "python init_pg_db_cli.py && uvicorn main:app --host 0.0.0.0 --port 8000 --workers 1"]
+# Auto-initialize PostgreSQL tables (init_pg_db_cli.py) and launch FastAPI Uvicorn server on APP_PORT
+CMD python init_pg_db_cli.py || true; exec uvicorn main:app --host 0.0.0.0 --port ${APP_PORT:-8000} --workers 1
